@@ -13,6 +13,7 @@ struct ReceivedFileMeta {
     uint32_t file_id;
     uint64_t total_size;
     std::string relative_path;
+    std::string file_hash;
 };
 
 class ReceiverEngine {

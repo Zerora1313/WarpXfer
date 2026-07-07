@@ -9,8 +9,28 @@
 #include <iomanip>
 #include <chrono>
 #include <conio.h>
+#include <filesystem>
+#include <vector>
 
 namespace core {
+
+static void InitializeHashForResume(crypto::SHA256& sha, const std::string& filepath, uint64_t resume_offset) {
+    sha.Init();
+    if (resume_offset == 0) return;
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f.is_open()) return;
+    const size_t buf_size = 64 * 1024;
+    std::vector<uint8_t> buffer(buf_size);
+    uint64_t read_total = 0;
+    while (read_total < resume_offset) {
+        uint64_t to_read = (resume_offset - read_total < buf_size) ? (resume_offset - read_total) : buf_size;
+        f.read(reinterpret_cast<char*>(buffer.data()), to_read);
+        std::streamsize bytes = f.gcount();
+        if (bytes <= 0) break;
+        sha.Update(buffer.data(), bytes);
+        read_total += bytes;
+    }
+}
 
 static uint64_t GetCurrentTimeSeconds() {
     auto now = std::chrono::steady_clock::now();
@@ -252,6 +272,10 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
     bool progress_started = false;
     bool session_completed = false;
 
+    crypto::SHA256 active_file_sha;
+    uint32_t active_file_id = 0xFFFFFFFF;
+    uint64_t active_file_start_offset = 0;
+
     // Loop for receiving packets
     while (true) {
         network::PacketType p_type;
@@ -266,16 +290,17 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
         }
 
         if (p_type == network::PacketType::FILE_METADATA) {
-            if (p_payload.size() < 14) continue;
+            if (p_payload.size() < 78) continue;
             uint32_t file_id = network::ReadUint32(p_payload.data());
             uint64_t file_size = network::ReadUint64(p_payload.data() + 4);
-            uint16_t path_len = (p_payload[12] << 8) | p_payload[13];
-            std::string path(reinterpret_cast<const char*>(p_payload.data() + 14), path_len);
+            std::string expected_hash(reinterpret_cast<const char*>(p_payload.data() + 12), 64);
+            uint16_t path_len = (p_payload[76] << 8) | p_payload[77];
+            std::string path(reinterpret_cast<const char*>(p_payload.data() + 78), path_len);
 
             if (file_id >= files.size()) {
                 files.resize(file_id + 1);
             }
-            files[file_id] = {file_id, file_size, path};
+            files[file_id] = {file_id, file_size, path, expected_hash};
 
             // Check if file exists and get size for resuming
             std::string full_path = fileio::NormalizePath(save_dir + "/" + path);
@@ -294,47 +319,59 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
             network::SendPacket(s, network::PacketType::CHUNK_ACK, ack_payload);
         }
         else if (p_type == network::PacketType::FILE_CHUNK) {
-            if (p_payload.size() < 80) continue;
+            if (p_payload.size() < 16) continue;
             uint32_t file_id = network::ReadUint32(p_payload.data());
             uint64_t offset = network::ReadUint64(p_payload.data() + 4);
             uint32_t chunk_size = network::ReadUint32(p_payload.data() + 12);
-            
-            std::string hash_str(reinterpret_cast<const char*>(p_payload.data() + 16), 64);
-            const uint8_t* chunk_data = p_payload.data() + 80;
+            const uint8_t* chunk_data = p_payload.data() + 16;
 
             if (file_id >= files.size()) continue;
             const auto& file_meta = files[file_id];
 
-            // Verify chunk SHA-256
-            std::string local_hash = crypto::CalculateSHA256(chunk_data, chunk_size);
-            uint8_t status = (local_hash == hash_str) ? 1 : 0;
-
-            if (status == 1) {
-                // Write chunk directly to file (eliminates custom file writer objects)
+            // If we are starting a new file or starting a retry
+            if (active_file_id != file_id || offset == 0) {
+                active_file_id = file_id;
+                active_file_start_offset = offset;
                 std::string full_path = fileio::NormalizePath(save_dir + "/" + file_meta.relative_path);
-                
-                std::string dir = fileio::GetDirectoryOfPath(full_path);
-                if (!dir.empty()) {
-                    fileio::CreateDirectoryRecursive(dir);
-                }
+                InitializeHashForResume(active_file_sha, full_path, offset);
+            }
 
-                std::ofstream out(full_path, std::ios::binary | std::ios::in | std::ios::out);
-                if (!out.is_open()) {
-                    // Try creating
-                    out.open(full_path, std::ios::binary | std::ios::out);
-                    if (out.is_open()) {
-                        out.close();
-                        out.open(full_path, std::ios::binary | std::ios::in | std::ios::out);
-                    }
-                }
+            // Write chunk to file
+            std::string full_path = fileio::NormalizePath(save_dir + "/" + file_meta.relative_path);
+            
+            std::string dir = fileio::GetDirectoryOfPath(full_path);
+            if (!dir.empty()) {
+                fileio::CreateDirectoryRecursive(dir);
+            }
 
+            std::ofstream out(full_path, std::ios::binary | std::ios::in | std::ios::out);
+            if (!out.is_open()) {
+                out.open(full_path, std::ios::binary | std::ios::out);
                 if (out.is_open()) {
-                    out.seekp(offset, std::ios::beg);
-                    out.write(reinterpret_cast<const char*>(chunk_data), chunk_size);
-                    out.flush();
                     out.close();
-                } else {
-                    status = 0; // write fail
+                    out.open(full_path, std::ios::binary | std::ios::in | std::ios::out);
+                }
+            }
+
+            uint8_t status = 0;
+            if (out.is_open()) {
+                out.seekp(offset, std::ios::beg);
+                out.write(reinterpret_cast<const char*>(chunk_data), chunk_size);
+                out.flush();
+                out.close();
+                status = 1;
+                
+                // Update running hash context
+                active_file_sha.Update(chunk_data, chunk_size);
+            }
+
+            // If this is the last chunk, perform final validation!
+            if (status == 1 && (offset + chunk_size >= file_meta.total_size)) {
+                std::string final_hash = active_file_sha.FinalHex();
+                if (final_hash != file_meta.file_hash) {
+                    // Validation failed! Delete file
+                    std::filesystem::remove(full_path);
+                    status = 2; // status 2 means validation failure
                 }
             }
 
@@ -357,6 +394,15 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
                 bytes_received += chunk_size;
                 if (offset + chunk_size >= file_meta.total_size) {
                     files_completed++;
+                }
+                progress.Update(bytes_received, files_completed);
+            } else if (status == 2) {
+                // Subtract bytes received for this file attempt to keep progress bar accurate
+                uint64_t bytes_sent_this_attempt = (offset + chunk_size - active_file_start_offset);
+                if (bytes_received >= bytes_sent_this_attempt) {
+                    bytes_received -= bytes_sent_this_attempt;
+                } else {
+                    bytes_received = 0;
                 }
                 progress.Update(bytes_received, files_completed);
             }

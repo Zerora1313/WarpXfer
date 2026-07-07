@@ -161,10 +161,13 @@ bool SenderEngine::SendFilesMetadata(const fileio::ScanResult& scan, std::vector
     for (uint32_t i = 0; i < scan.files.size(); ++i) {
         const auto& file = scan.files[i];
         
-        std::vector<uint8_t> payload(4 + 8 + 2 + file.relative_path.size());
+        std::string file_hash = crypto::CalculateFileSHA256(file.absolute_path);
+
+        std::vector<uint8_t> payload(4 + 8 + 64 + 2 + file.relative_path.size());
         uint8_t* ptr = payload.data();
         network::WriteUint32(ptr, i); ptr += 4;
         network::WriteUint64(ptr, file.size); ptr += 8;
+        std::memcpy(ptr, file_hash.c_str(), 64); ptr += 64;
 
         uint16_t path_len = static_cast<uint16_t>(file.relative_path.size());
         ptr[0] = (path_len >> 8) & 0xFF;
@@ -212,73 +215,123 @@ bool SenderEngine::TransferData(const fileio::ScanResult& scan, const std::vecto
     progress.Start(scan.total_size, scan.total_files);
     progress.Update(total_transferred, completed_files);
 
-    const int CHUNK_SIZE = 8192;
+    const int CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB
     std::unique_ptr<uint8_t[]> buffer(new uint8_t[CHUNK_SIZE]);
 
     for (uint32_t i = 0; i < scan.files.size(); ++i) {
         const auto& file_info = scan.files[i];
-        uint64_t offset = resume_offsets[i];
+        uint64_t start_offset = resume_offsets[i];
 
-        if (offset >= file_info.size) {
+        if (start_offset >= file_info.size) {
             continue;
         }
 
-        // Inline File IO read stream
-        std::ifstream file(file_info.absolute_path, std::ios::binary);
-        if (!file.is_open()) {
-            std::cerr << "\nFailed to open source file: " << file_info.absolute_path << std::endl;
+        int attempt = 0;
+        const int MAX_ATTEMPTS = 3; // 1 original + 2 retries
+        bool file_success = false;
+
+        while (attempt < MAX_ATTEMPTS && !file_success) {
+            uint64_t offset = start_offset;
+            uint64_t transferred_this_attempt = 0;
+
+            if (attempt > 0) {
+                std::cout << "\n" << ui::Yellow() << "⚠️  Validation failed for " << file_info.relative_path 
+                          << ". Retrying (Attempt " << attempt + 1 << " of " << MAX_ATTEMPTS << ")..." << ui::Reset() << std::endl;
+            }
+
+            // Inline File IO read stream
+            std::ifstream file(file_info.absolute_path, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "\nFailed to open source file: " << file_info.absolute_path << std::endl;
+                return false;
+            }
+
+            file.seekg(offset, std::ios::beg);
+            file_success = true; // assume success
+
+            while (offset < file_info.size) {
+                uint64_t remaining = file_info.size - offset;
+                int to_read = (remaining < (uint64_t)CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
+
+                file.read(reinterpret_cast<char*>(buffer.get()), to_read);
+                int read_bytes = static_cast<int>(file.gcount());
+                if (read_bytes <= 0) {
+                    file_success = false;
+                    break;
+                }
+
+                std::vector<uint8_t> payload(16 + read_bytes);
+                uint8_t* ptr = payload.data();
+                network::WriteUint32(ptr, i); ptr += 4;
+                network::WriteUint64(ptr, offset); ptr += 8;
+                network::WriteUint32(ptr, static_cast<uint32_t>(read_bytes)); ptr += 4;
+                std::memcpy(ptr, buffer.get(), read_bytes);
+
+                if (!network::SendPacket(m_socket, network::PacketType::FILE_CHUNK, payload)) {
+                    file_success = false;
+                    break;
+                }
+
+                network::PacketType ack_type;
+                std::vector<uint8_t> ack_payload;
+                if (!network::ReceivePacket(m_socket, ack_type, ack_payload)) {
+                    file_success = false;
+                    break;
+                }
+
+                if (ack_type != network::PacketType::CHUNK_ACK || ack_payload.size() < 13) {
+                    file_success = false;
+                    break;
+                }
+
+                uint32_t ack_file_id = network::ReadUint32(ack_payload.data());
+                uint64_t ack_offset = network::ReadUint64(ack_payload.data() + 4);
+                uint8_t ack_status = ack_payload[12];
+
+                if (ack_file_id != i || ack_offset != offset) {
+                    file_success = false;
+                    break;
+                }
+
+                if (ack_status == 0) {
+                    std::cerr << "\nChunk transmission error for file " << i << " offset " << offset << std::endl;
+                    file_success = false;
+                    break;
+                }
+
+                if (ack_status == 2) {
+                    // Whole-file validation failed on receiver!
+                    file_success = false;
+                    break;
+                }
+
+                offset += read_bytes;
+                transferred_this_attempt += read_bytes;
+                total_transferred += read_bytes;
+                progress.Update(total_transferred, completed_files);
+            }
+
+            file.close();
+
+            if (!file_success) {
+                // Subtract whatever we transferred during this failed attempt
+                if (total_transferred >= transferred_this_attempt) {
+                    total_transferred -= transferred_this_attempt;
+                } else {
+                    total_transferred = 0;
+                }
+                progress.Update(total_transferred, completed_files);
+                attempt++;
+            }
+        }
+
+        if (!file_success) {
+            std::cerr << "\n" << ui::Red() << "❌ Error: File validation failed after multiple attempts." << std::endl;
+            std::cerr << "File: " << file_info.relative_path << " is corrupted." << std::endl;
+            std::cerr << "The transfer session has been aborted. Please check your network connection stability and try again." << ui::Reset() << std::endl;
             return false;
         }
 
-        file.seekg(offset, std::ios::beg);
-
-        while (offset < file_info.size) {
-            uint64_t remaining = file_info.size - offset;
-            int to_read = (remaining < (uint64_t)CHUNK_SIZE) ? (int)remaining : CHUNK_SIZE;
-
-            file.read(reinterpret_cast<char*>(buffer.get()), to_read);
-            int read_bytes = static_cast<int>(file.gcount());
-            if (read_bytes <= 0) break;
-
-            std::string hash = crypto::CalculateSHA256(buffer.get(), read_bytes);
-
-            std::vector<uint8_t> payload(4 + 8 + 4 + 64 + read_bytes);
-            uint8_t* ptr = payload.data();
-            network::WriteUint32(ptr, i); ptr += 4;
-            network::WriteUint64(ptr, offset); ptr += 8;
-            network::WriteUint32(ptr, static_cast<uint32_t>(read_bytes)); ptr += 4;
-            std::memcpy(ptr, hash.c_str(), 64); ptr += 64;
-            std::memcpy(ptr, buffer.get(), read_bytes);
-
-            if (!network::SendPacket(m_socket, network::PacketType::FILE_CHUNK, payload)) {
-                return false;
-            }
-
-            network::PacketType ack_type;
-            std::vector<uint8_t> ack_payload;
-            if (!network::ReceivePacket(m_socket, ack_type, ack_payload)) {
-                return false;
-            }
-
-            if (ack_type != network::PacketType::CHUNK_ACK || ack_payload.size() < 13) {
-                return false;
-            }
-
-            uint32_t ack_file_id = network::ReadUint32(ack_payload.data());
-            uint64_t ack_offset = network::ReadUint64(ack_payload.data() + 4);
-            uint8_t ack_status = ack_payload[12];
-
-            if (ack_file_id != i || ack_offset != offset || ack_status == 0) {
-                std::cerr << "\nChunk ACK verification failed for file " << i << " offset " << offset << std::endl;
-                return false;
-            }
-
-            offset += read_bytes;
-            total_transferred += read_bytes;
-            progress.Update(total_transferred, completed_files);
-        }
-
-        file.close();
         completed_files++;
         progress.Update(total_transferred, completed_files);
     }
