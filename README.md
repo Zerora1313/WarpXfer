@@ -11,7 +11,6 @@ By establishing direct sockets between devices, it eliminates the need for any c
 - **Adaptive Chunk Size Sizing:** Automatically runs a ping-pong latency check (RTT) before session startup and adjusts the block transfer size (from 256 KB to 8 MB) to match network signal strength.
 - **Stateful Resume Protocol:** Scans target paths for partially downloaded files, negotiates byte offsets via a handshake, and resumes transmission from the point of interruption.
 - **On-the-fly (Lazy) SHA-256 Hashing:** Features a native, dependency-free SHA-256 implementation that updates hash bytes inline as blocks are read from disk. This removes upfront hash generation freezes for large folders.
-- **Advanced Network Optimization:** Boosts transfer speeds by tuning socket kernel buffers (4 MB buffers), disabling Nagle's algorithm (`TCP_NODELAY`), and using persistent file streams to reduce kernel-level write overhead.
 
 ---
 
@@ -27,7 +26,7 @@ By establishing direct sockets between devices, it eliminates the need for any c
 1. **Discovery:** The receiver listens on UDP; the sender broadcasts a `DISCOVER_REQ`. The receiver responds with its connection parameters.
 2. **Latency Check:** The sender pings the receiver to compute RTT and select the chunk size.
 3. **Offset Handshake:** Receiver reports local partial file sizes so the sender can seek (`seekg`) and resume.
-4. **Optimized Transfer:** Sender streams blocks, updates SHA-256 context inline, and writes to the TCP socket immediately (Nagle's delay bypassed). Receiver writes to disk using a persistent file handle.
+4. **Optimized Transfer:** Sender streams blocks and updates the SHA-256 context inline. Receiver writes incoming chunks to disk using a persistent file handle to minimize write overhead.
 5. **Hash Validation:** Once the last block is written, the receiver compares its final hash against the sender's. If they match, the file is saved; otherwise, it is deleted and re-requested.
 
 ---
