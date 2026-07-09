@@ -1,15 +1,17 @@
-# 🚀 WarpXfer - High-Performance local P2P File Transfer Utility
+# 🚀 WarpXfer - High-Performance P2P Local File Transfer Utility
 
-WarpXfer is a high-performance, cross-platform, peer-to-peer (P2P) local file and folder transfer application written in **Modern C++**. It allows quick and secure direct transfers between devices on the same local area network (LAN/Wi-Fi) without relying on intermediate servers.
+WarpXfer is an **easy-to-use, user-friendly, and blazing fast command-line interface (CLI) tool** written in **Modern C++** for direct peer-to-peer (P2P) file and folder transfers across local area networks (LAN/Wi-Fi). 
+
+By establishing direct sockets between devices, it eliminates the need for any cloud servers, internet bandwidth, or registration, providing secure and localized file sharing at the physical speed limit of your local connection.
 
 ---
 
 ## ✨ Key Features
-- **Zero-Configuration Discovery:** Seamless peer matching using local network UDP broadcasts (port `9000`), automatically displaying online receivers with funny generated usernames.
-- **Adaptive Chunk Size Sizing:** Measures round-trip latency (RTT) dynamically using a ping-pong handshake and matches transmission block size (ranging from 256 KB to 8 MB) to network conditions.
-- **Stateful Transfer Resuming:** Automatically detects partially transferred files, calculates exact offsets, and resumes file transmission from the point of interruption.
-- **On-the-fly (Lazy) SHA-256 Hashing:** Native C++ dependency-free SHA-256 implementation that computes hash contexts inline during disk read operations, avoiding startup delays for large file transfers.
-- **High Network Optimization:** Maximizes socket throughput via kernel buffer tuning (4 MB send/receive buffers), disabling Nagle's algorithm (`TCP_NODELAY`), and using persistent file streams to reduce kernel I/O system calls.
+- **Zero-Configuration Auto-Discovery:** Instant serverless peer discovery using UDP broadcasts (port `9000`). It scans the local network and displays online receivers with dynamically generated funny aliases.
+- **Adaptive Chunk Size Sizing:** Automatically runs a ping-pong latency check (RTT) before session startup and adjusts the block transfer size (from 256 KB to 8 MB) to match network signal strength.
+- **Stateful Resume Protocol:** Scans target paths for partially downloaded files, negotiates byte offsets via a handshake, and resumes transmission from the point of interruption.
+- **On-the-fly (Lazy) SHA-256 Hashing:** Features a native, dependency-free SHA-256 implementation that updates hash bytes inline as blocks are read from disk. This removes upfront hash generation freezes for large folders.
+- **Advanced Network Optimization:** Boosts transfer speeds by tuning socket kernel buffers (4 MB buffers), disabling Nagle's algorithm (`TCP_NODELAY`), and using persistent file streams to reduce kernel-level write overhead.
 
 ---
 
@@ -22,11 +24,11 @@ WarpXfer is a high-performance, cross-platform, peer-to-peer (P2P) local file an
 ---
 
 ## ⚙️ How It Works
-1. **Discovery:** The sender broadcasts a `DISCOVER_REQ` UDP packet. Active receivers listen and reply back with their TCP port, IP, and alias name.
-2. **RTT Ping:** The sender runs a ping-pong measurement against the selected receiver to pick the optimal chunk size.
-3. **Metadata & Handshake:** The sender transmits files metadata. The receiver checks local storage to determine if any file is partially downloaded and replies with the matching byte offset.
-4. **Streaming & Verification:** The sender reads chunks from disk, updates the running SHA-256 context in memory, and writes to TCP. The receiver updates its running SHA-256 context, writes to disk, and sends ACKs.
-5. **Finalization:** The sender sends a `FILE_HASH_UPDATE` packet with the final hash. The receiver finalizes its context, matches hashes, and commits the file.
+1. **Discovery:** The receiver listens on UDP; the sender broadcasts a `DISCOVER_REQ`. The receiver responds with its connection parameters.
+2. **Latency Check:** The sender pings the receiver to compute RTT and select the chunk size.
+3. **Offset Handshake:** Receiver reports local partial file sizes so the sender can seek (`seekg`) and resume.
+4. **Optimized Transfer:** Sender streams blocks, updates SHA-256 context inline, and writes to the TCP socket immediately (Nagle's delay bypassed). Receiver writes to disk using a persistent file handle.
+5. **Hash Validation:** Once the last block is written, the receiver compares its final hash against the sender's. If they match, the file is saved; otherwise, it is deleted and re-requested.
 
 ---
 
@@ -37,10 +39,10 @@ WarpXfer is a high-performance, cross-platform, peer-to-peer (P2P) local file an
 - On Windows: MinGW or MSVC environment.
 
 ### Compiling
-To compile the project into `warp.exe` (or `warp` binary):
+To build the project into `warp.exe` (or `warp` binary):
 
 **On Windows (using GCC/MinGW):**
-Simply run the helper batch script:
+Run the helper script:
 ```cmd
 warp.bat
 ```
@@ -49,6 +51,28 @@ warp.bat
 ```bash
 make
 ```
+
+---
+
+## 💡 Pro Tip: Run WarpXfer from Anywhere (Environment PATH Setup)
+
+Instead of copying `warp.exe` to every folder you want to transfer, add it to your system's environment variables to run it system-wide from any terminal folder.
+
+### On Windows (PowerShell):
+1. Create a dedicated folder (e.g., `C:\Program Files\WarpXfer` or a custom directory inside your profile) and move your compiled `warp.exe` there.
+2. Run PowerShell as **Administrator** and execute the following command to add it to the User PATH:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("PATH", [System.Environment]::GetEnvironmentVariable("PATH", "User") + ";C:\Path\To\Your\WarpXfer\Folder", "User")
+   ```
+3. Restart your terminal. You can now run `warp send` or `warp receive` from any directory!
+
+### On Linux / macOS:
+1. Move the compiled `warp` binary to `/usr/local/bin` (requires root privileges):
+   ```bash
+   sudo cp warp /usr/local/bin/
+   sudo chmod +x /usr/local/bin/warp
+   ```
+2. Now, you can invoke `warp` from any directory in your terminal!
 
 ---
 
