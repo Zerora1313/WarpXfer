@@ -130,10 +130,11 @@ int SelectDevice(const std::vector<network::DiscoveredDevice>& devices) {
 // ProgressBar Implementation
 ProgressBar::ProgressBar() : m_total_bytes(0), m_total_files(0), m_last_bytes(0), m_current_speed(0.0) {}
 
-void ProgressBar::Start(uint64_t total_bytes, uint32_t total_files) {
+void ProgressBar::Start(uint64_t total_bytes, uint32_t total_files, uint64_t initial_bytes) {
     m_total_bytes = total_bytes;
     m_total_files = total_files;
-    m_last_bytes = 0;
+    m_last_bytes = initial_bytes;
+    m_initial_bytes = initial_bytes;
     m_current_speed = 0.0;
     m_start_time = std::chrono::steady_clock::now();
     m_last_update_time = m_start_time;
@@ -163,22 +164,12 @@ void ProgressBar::Update(uint64_t current_bytes, uint32_t current_files) {
 
     auto now = std::chrono::steady_clock::now();
     auto elapsed_total_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - m_start_time).count();
-    auto elapsed_delta_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - m_last_update_time).count();
 
-    if (elapsed_delta_sec > 0.05) {
-        uint64_t delta_bytes = current_bytes - m_last_bytes;
-        double instant_speed = (static_cast<double>(delta_bytes) / (1024.0 * 1024.0)) / elapsed_delta_sec;
-        
-        if (m_current_speed == 0.0) {
-            m_current_speed = instant_speed;
-        } else {
-            m_current_speed = 0.8 * m_current_speed + 0.2 * instant_speed;
-        }
-
-        m_last_bytes = current_bytes;
-        m_last_update_time = now;
-    } else if (m_current_speed == 0.0 && elapsed_total_sec > 0) {
-        m_current_speed = (static_cast<double>(current_bytes) / (1024.0 * 1024.0)) / elapsed_total_sec;
+    if (elapsed_total_sec > 0.1) {
+        uint64_t active_bytes = (current_bytes > m_initial_bytes) ? (current_bytes - m_initial_bytes) : 0;
+        m_current_speed = (static_cast<double>(active_bytes) / (1024.0 * 1024.0)) / elapsed_total_sec;
+    } else {
+        m_current_speed = 0.0;
     }
 
     double percent = (static_cast<double>(current_bytes) / m_total_bytes) * 100.0;

@@ -6,10 +6,12 @@
 #include <fstream>
 #include <cstring>
 #include <memory>
+#include <chrono>
+#include <iomanip>
 
 namespace core {
 
-SenderEngine::SenderEngine() : m_socket(INVALID_SOCKET) {}
+SenderEngine::SenderEngine() : m_socket(INVALID_SOCKET), m_chunk_size(4 * 1024 * 1024) {}
 
 SenderEngine::~SenderEngine() {
     if (m_socket != INVALID_SOCKET) {
@@ -52,6 +54,22 @@ bool SenderEngine::ConnectAndTransfer(const std::string& ip, uint16_t port, cons
         return false;
     }
 
+    // TCP Socket Tuning — Maximize throughput on local networks
+    {
+        // Disable Nagle's algorithm: send chunks immediately without buffering small packets
+        int flag = 1;
+        setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&flag), sizeof(flag));
+
+        // Increase TCP kernel send buffer to 4 MB so the OS can pipeline more data per RTT
+        int snd_buf = 4 * 1024 * 1024;
+        setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF,
+                   reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
+    }
+
+    // Adaptive Chunk Size: Measure RTT now and pick optimal chunk size
+    m_chunk_size = MeasureRTTAndGetChunkSize();
+
     std::cout << ui::Green() << "⚡ Connected successfully!\n" << ui::Reset() << std::endl;
 
     fileio::ScanResult scan = fileio::ScanFolderOrFile(source_path);
@@ -81,13 +99,71 @@ bool SenderEngine::ConnectAndTransfer(const std::string& ip, uint16_t port, cons
     return true;
 }
 
+int SenderEngine::MeasureRTTAndGetChunkSize() {
+    // Send 5 PING packets and measure average RTT to determine optimal chunk size.
+    // The receiver responds to each PING with a PONG before the session starts.
+    const int PING_COUNT = 5;
+    double total_rtt_ms = 0.0;
+    int valid_pings = 0;
+
+    for (int p = 0; p < PING_COUNT; ++p) {
+        // PING payload: 4-byte sequence number
+        std::vector<uint8_t> ping_payload(4);
+        network::WriteUint32(ping_payload.data(), static_cast<uint32_t>(p));
+
+        auto t_start = std::chrono::steady_clock::now();
+        if (!network::SendPacket(m_socket, network::PacketType::PING, ping_payload)) break;
+
+        network::PacketType resp_type;
+        std::vector<uint8_t> resp_payload;
+        if (!network::ReceivePacket(m_socket, resp_type, resp_payload)) break;
+
+        auto t_end = std::chrono::steady_clock::now();
+        if (resp_type == network::PacketType::PONG) {
+            double rtt = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            total_rtt_ms += rtt;
+            valid_pings++;
+        }
+    }
+
+    double avg_rtt_ms = (valid_pings > 0) ? (total_rtt_ms / valid_pings) : 20.0;
+
+    // Determine optimal chunk size based on measured RTT
+    int chunk_size;
+    const char* network_type;
+    if (avg_rtt_ms < 2.0) {
+        chunk_size = 8 * 1024 * 1024;   // 8 MB — Direct LAN / same-room 5 GHz
+        network_type = "LAN/5GHz (RTT < 2ms)  → 8 MB chunks";
+    } else if (avg_rtt_ms < 5.0) {
+        chunk_size = 4 * 1024 * 1024;   // 4 MB — Good Wi-Fi
+        network_type = "Good Wi-Fi (RTT < 5ms) → 4 MB chunks";
+    } else if (avg_rtt_ms < 15.0) {
+        chunk_size = 2 * 1024 * 1024;   // 2 MB — Normal Wi-Fi
+        network_type = "Wi-Fi (RTT < 15ms)     → 2 MB chunks";
+    } else if (avg_rtt_ms < 50.0) {
+        chunk_size = 1 * 1024 * 1024;   // 1 MB — Weak / cross-room Wi-Fi
+        network_type = "Weak Wi-Fi (RTT < 50ms)→ 1 MB chunks";
+    } else {
+        chunk_size = 256 * 1024;        // 256 KB — High-latency / Internet
+        network_type = "High Latency (RTT>50ms)→ 256 KB chunks";
+    }
+
+    std::cout << ui::Cyan() << "📡 Network: " << network_type
+              << "  (avg RTT: " << std::fixed << std::setprecision(2) << avg_rtt_ms << " ms)"
+              << ui::Reset() << std::endl;
+
+    return chunk_size;
+}
+
 bool SenderEngine::Handshake(const fileio::ScanResult& scan, const std::string& sender_name, std::vector<uint64_t>& resume_offsets) {
     std::vector<uint8_t> payload;
-    payload.resize(4 + 8 + 2 + scan.root_name.size() + 2 + sender_name.size());
+    // Pack: files_count(4) + total_size(8) + negotiated_chunk_size(4) + root_name(2+N) + sender_name(2+N)
+    payload.resize(4 + 8 + 4 + 2 + scan.root_name.size() + 2 + sender_name.size());
 
     uint8_t* ptr = payload.data();
     network::WriteUint32(ptr, scan.total_files); ptr += 4;
     network::WriteUint64(ptr, scan.total_size); ptr += 8;
+    network::WriteUint32(ptr, static_cast<uint32_t>(m_chunk_size)); ptr += 4; // Negotiated chunk size
 
     uint16_t root_len = static_cast<uint16_t>(scan.root_name.size());
     ptr[0] = (root_len >> 8) & 0xFF;
@@ -158,16 +234,21 @@ bool SenderEngine::Handshake(const fileio::ScanResult& scan, const std::string& 
 }
 
 bool SenderEngine::SendFilesMetadata(const fileio::ScanResult& scan, std::vector<uint64_t>& resume_offsets) {
+    // Lazy hash — do NOT pre-compute full-file SHA-256 here.
+    // We send a placeholder hash in metadata and compute the real hash inline
+    // while reading chunks in TransferData(). This eliminates the upfront
+    // multi-second wait for large files before any data starts moving.
     for (uint32_t i = 0; i < scan.files.size(); ++i) {
         const auto& file = scan.files[i];
-        
-        std::string file_hash = crypto::CalculateFileSHA256(file.absolute_path);
+
+        // Placeholder hash (64 zeros) — real hash computed and cached in TransferData
+        const std::string placeholder_hash(64, '0');
 
         std::vector<uint8_t> payload(4 + 8 + 64 + 2 + file.relative_path.size());
         uint8_t* ptr = payload.data();
         network::WriteUint32(ptr, i); ptr += 4;
         network::WriteUint64(ptr, file.size); ptr += 8;
-        std::memcpy(ptr, file_hash.c_str(), 64); ptr += 64;
+        std::memcpy(ptr, placeholder_hash.c_str(), 64); ptr += 64;
 
         uint16_t path_len = static_cast<uint16_t>(file.relative_path.size());
         ptr[0] = (path_len >> 8) & 0xFF;
@@ -212,11 +293,17 @@ bool SenderEngine::TransferData(const fileio::ScanResult& scan, const std::vecto
         }
     }
 
-    progress.Start(scan.total_size, scan.total_files);
+    progress.Start(scan.total_size, scan.total_files, total_transferred);
     progress.Update(total_transferred, completed_files);
 
-    const int CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB
+    // Adaptive chunk size: use the RTT-negotiated size instead of hardcoded 4 MB.
+    const int CHUNK_SIZE = m_chunk_size;
+
+    // Pre-allocate one reusable read buffer and one payload buffer.
+    // This eliminates heap allocation overhead for each chunk transfer.
     std::unique_ptr<uint8_t[]> buffer(new uint8_t[CHUNK_SIZE]);
+    std::vector<uint8_t> payload_buf;
+    payload_buf.reserve(16 + CHUNK_SIZE); // Allocate max capacity once
 
     for (uint32_t i = 0; i < scan.files.size(); ++i) {
         const auto& file_info = scan.files[i];
@@ -227,15 +314,18 @@ bool SenderEngine::TransferData(const fileio::ScanResult& scan, const std::vecto
         }
 
         int attempt = 0;
-        const int MAX_ATTEMPTS = 3; // 1 original + 2 retries
+        const int MAX_ATTEMPTS = 3;
         bool file_success = false;
 
         while (attempt < MAX_ATTEMPTS && !file_success) {
             uint64_t offset = start_offset;
             uint64_t transferred_this_attempt = 0;
 
+            // Streaming SHA-256: initialize fresh context per attempt
+            crypto::SHA256 file_sha;
+
             if (attempt > 0) {
-                std::cout << "\n" << ui::Yellow() << "⚠️  Validation failed for " << file_info.relative_path 
+                std::cout << "\n" << ui::Yellow() << "⚠️  Validation failed for " << file_info.relative_path
                           << ". Retrying (Attempt " << attempt + 1 << " of " << MAX_ATTEMPTS << ")..." << ui::Reset() << std::endl;
             }
 
@@ -260,14 +350,18 @@ bool SenderEngine::TransferData(const fileio::ScanResult& scan, const std::vecto
                     break;
                 }
 
-                std::vector<uint8_t> payload(16 + read_bytes);
-                uint8_t* ptr = payload.data();
+                // Feed this chunk into the streaming SHA-256 context (free — data already in buffer)
+                file_sha.Update(buffer.get(), read_bytes);
+
+                // Reuse pre-allocated buffer (no per-chunk heap allocation)
+                payload_buf.resize(16 + read_bytes);
+                uint8_t* ptr = payload_buf.data();
                 network::WriteUint32(ptr, i); ptr += 4;
                 network::WriteUint64(ptr, offset); ptr += 8;
                 network::WriteUint32(ptr, static_cast<uint32_t>(read_bytes)); ptr += 4;
                 std::memcpy(ptr, buffer.get(), read_bytes);
 
-                if (!network::SendPacket(m_socket, network::PacketType::FILE_CHUNK, payload)) {
+                if (!network::SendPacket(m_socket, network::PacketType::FILE_CHUNK, payload_buf)) {
                     file_success = false;
                     break;
                 }
@@ -312,6 +406,36 @@ bool SenderEngine::TransferData(const fileio::ScanResult& scan, const std::vecto
             }
 
             file.close();
+
+            // After all chunks sent successfully, send the final computed hash to receiver
+            // and wait for its validation ACK. This is the true "streaming hash" approach:
+            // hash is computed as a free side-effect of reading data, no blocking pre-pass.
+            if (file_success) {
+                std::string computed_hash = file_sha.FinalHex();
+
+                std::vector<uint8_t> hash_upd(4 + 64);
+                network::WriteUint32(hash_upd.data(), i);
+                std::memcpy(hash_upd.data() + 4, computed_hash.c_str(), 64);
+                if (!network::SendPacket(m_socket, network::PacketType::FILE_HASH_UPDATE, hash_upd)) {
+                    file_success = false;
+                } else {
+                    // Wait for receiver's validation ACK
+                    network::PacketType val_type;
+                    std::vector<uint8_t> val_payload;
+                    if (!network::ReceivePacket(m_socket, val_type, val_payload)) {
+                        file_success = false;
+                    } else if (val_type == network::PacketType::CHUNK_ACK && val_payload.size() >= 13) {
+                        uint8_t val_status = val_payload[12];
+                        if (val_status == 2) {
+                            // Receiver says hash mismatch — retry
+                            file_success = false;
+                        }
+                        // val_status == 1 means validation passed ✔️
+                    } else {
+                        file_success = false;
+                    }
+                }
+            }
 
             if (!file_success) {
                 // Subtract whatever we transferred during this failed attempt

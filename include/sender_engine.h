@@ -17,7 +17,9 @@ public:
 
 private:
     SocketType m_socket;
+    int m_chunk_size; // Adaptively determined chunk size in bytes
 
+    int  MeasureRTTAndGetChunkSize();  // Sends 5 PINGs, measures RTT, returns optimal chunk size
     bool Handshake(const fileio::ScanResult& scan, const std::string& sender_name, std::vector<uint64_t>& resume_offsets);
     bool SendFilesMetadata(const fileio::ScanResult& scan, std::vector<uint64_t>& resume_offsets);
     bool TransferData(const fileio::ScanResult& scan, const std::vector<uint64_t>& resume_offsets);

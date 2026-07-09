@@ -28,7 +28,7 @@ int SelectDevice(const std::vector<network::DiscoveredDevice>& devices);
 class ProgressBar {
 public:
     ProgressBar();
-    void Start(uint64_t total_bytes, uint32_t total_files);
+    void Start(uint64_t total_bytes, uint32_t total_files, uint64_t initial_bytes = 0);
     void Update(uint64_t current_bytes, uint32_t current_files);
     void Done();
 
@@ -37,6 +37,7 @@ private:
     uint64_t m_total_bytes;
     uint32_t m_total_files;
     uint64_t m_last_bytes;
+    uint64_t m_initial_bytes;
 
     std::chrono::steady_clock::time_point m_start_time;
     std::chrono::steady_clock::time_point m_last_update_time;

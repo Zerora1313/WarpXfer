@@ -128,6 +128,13 @@ void ReceiverEngine::ListenLoop(const std::string& save_dir, const std::string& 
         char* ip_str = inet_ntoa(client_addr.sin_addr);
         std::string client_ip = ip_str ? ip_str : "unknown";
 
+        // TCP Socket Tuning — Increase kernel receive buffer for high-throughput reads
+        {
+            int rcv_buf = 4 * 1024 * 1024;
+            setsockopt(client_socket, SOL_SOCKET, SO_RCVBUF,
+                       reinterpret_cast<const char*>(&rcv_buf), sizeof(rcv_buf));
+        }
+
         // Process sequentially (eliminates separate worker thread pools and mutex locks)
         HandleClient(client_socket, client_ip, save_dir, device_name);
 
@@ -138,24 +145,44 @@ void ReceiverEngine::ListenLoop(const std::string& save_dir, const std::string& 
 
 void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, const std::string& save_dir, const std::string& device_name) {
     (void)device_name;
+
+    // Adaptive Chunk Size: Respond to PING packets before session starts.
+    // Sender measures RTT using these pings to pick optimal chunk size.
     network::PacketType type;
     std::vector<uint8_t> payload;
-
-    if (!network::ReceivePacket(s, type, payload)) {
-        std::cerr << ui::Red() << "❌ Reception failed: Connection lost during session startup." << ui::Reset() << std::endl;
+    while (true) {
+        if (!network::ReceivePacket(s, type, payload)) {
+            std::cerr << ui::Red() << "❌ Reception failed: Connection lost during session startup." << ui::Reset() << std::endl;
+            CloseSocket(s);
+            return;
+        }
+        if (type == network::PacketType::PING) {
+            // Echo the same payload back as PONG immediately
+            network::SendPacket(s, network::PacketType::PONG, payload);
+            continue; // Wait for next packet (more PINGs or SESSION_START_REQ)
+        }
+        if (type == network::PacketType::SESSION_START_REQ) {
+            break; // Got the real session request, proceed
+        }
+        // Unexpected packet type during startup
         CloseSocket(s);
         return;
     }
 
-    if (type != network::PacketType::SESSION_START_REQ || payload.size() < 16) {
+    if (payload.size() < 20) { // 4+8+4+2+... minimum with chunk_size field
         CloseSocket(s);
         return;
     }
 
-    // Parse Payload
+    // Parse Payload — now includes negotiated chunk size from sender
     const uint8_t* ptr = payload.data();
     uint32_t files_count = network::ReadUint32(ptr); ptr += 4;
-    uint64_t total_size = network::ReadUint64(ptr); ptr += 8;
+    uint64_t total_size  = network::ReadUint64(ptr); ptr += 8;
+    uint32_t negotiated_chunk_size = network::ReadUint32(ptr); ptr += 4; // New: adaptive chunk size
+
+    // Clamp to sane bounds [256 KB, 16 MB]
+    if (negotiated_chunk_size < 256 * 1024)       negotiated_chunk_size = 256 * 1024;
+    if (negotiated_chunk_size > 16 * 1024 * 1024) negotiated_chunk_size = 16 * 1024 * 1024;
 
     uint16_t root_len = (ptr[0] << 8) | ptr[1]; ptr += 2;
     std::string root_name(reinterpret_cast<const char*>(ptr), root_len); ptr += root_len;
@@ -265,6 +292,9 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
         return;
     }
 
+    // Show clear UI message immediately after accept so receiver knows what's happening
+    std::cout << "\n" << ui::Yellow() << "⏳ Transfer accepted. Waiting for sender to start..." << ui::Reset() << std::endl;
+
     std::vector<ReceivedFileMeta> files;
     uint64_t bytes_received = 0;
     uint32_t files_completed = 0;
@@ -275,6 +305,12 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
     crypto::SHA256 active_file_sha;
     uint32_t active_file_id = 0xFFFFFFFF;
     uint64_t active_file_start_offset = 0;
+    std::string active_file_computed_hash; // Stores final hash until FILE_HASH_UPDATE arrives
+
+    // Keep one file stream open across all chunks of the same file.
+    // This eliminates open/close kernel syscall overhead for each chunk.
+    std::ofstream active_out;
+    std::string active_out_path;
 
     // Loop for receiving packets
     while (true) {
@@ -287,6 +323,51 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
         if (p_type == network::PacketType::SESSION_END) {
             session_completed = true;
             break;
+        }
+
+        // Streaming Hash: Receive final hash from sender and do validation now.
+        // This replaces the old "validate on last chunk" approach.
+        // Sender computes hash inline while sending, then sends FILE_HASH_UPDATE after all chunks.
+        if (p_type == network::PacketType::FILE_HASH_UPDATE) {
+            if (p_payload.size() >= 68) {
+                uint32_t file_id = network::ReadUint32(p_payload.data());
+                std::string sender_hash(reinterpret_cast<const char*>(p_payload.data() + 4), 64);
+
+                uint8_t val_status = 1; // default: pass
+                if (file_id < files.size()) {
+                    // Compare sender's computed hash with our computed hash
+                    if (active_file_computed_hash != sender_hash) {
+                        // Validation failed — delete partial file, signal retry
+                        if (active_out.is_open()) { active_out.close(); }
+                        std::filesystem::remove(active_out_path);
+                        std::cout << "\n" << ui::Yellow() << "⚠️  Validation failed for " << files[file_id].relative_path 
+                                  << " (Hash mismatch). Deleting corrupt file and waiting for retry..." << ui::Reset() << std::endl;
+                        active_file_id = 0xFFFFFFFF;
+                        active_file_computed_hash.clear();
+                        val_status = 2;
+                        if (progress_started) {
+                            uint64_t bytes_this_file = files[file_id].total_size - active_file_start_offset;
+                            if (bytes_received >= bytes_this_file) bytes_received -= bytes_this_file;
+                            else bytes_received = 0;
+                            progress.Update(bytes_received, files_completed);
+                        }
+                    } else {
+                        // Hash matched — close file cleanly, count it done
+                        if (active_out.is_open()) { active_out.flush(); active_out.close(); }
+                        active_file_computed_hash.clear();
+                        files_completed++;
+                        progress.Update(bytes_received, files_completed);
+                    }
+                }
+
+                // Send validation result ACK back to sender
+                std::vector<uint8_t> val_ack(13);
+                network::WriteUint32(val_ack.data(), file_id);
+                network::WriteUint64(val_ack.data() + 4, 0);
+                val_ack[12] = val_status;
+                network::SendPacket(s, network::PacketType::CHUNK_ACK, val_ack);
+            }
+            continue;
         }
 
         if (p_type == network::PacketType::FILE_METADATA) {
@@ -309,6 +390,7 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
             if (local_size > file_size) {
                 local_size = 0; // Overwrite if corrupted
             }
+            bytes_received += local_size;
 
             // Respond with ACK containing the current local size (as resume offset)
             std::vector<uint8_t> ack_payload(13);
@@ -328,82 +410,67 @@ void ReceiverEngine::HandleClient(SocketType s, const std::string& client_ip, co
             if (file_id >= files.size()) continue;
             const auto& file_meta = files[file_id];
 
-            // If we are starting a new file or starting a retry
+            // If we are starting a new file or starting a retry, open new stream
             if (active_file_id != file_id || offset == 0) {
+                // Close previous file stream if open
+                if (active_out.is_open()) {
+                    active_out.flush();
+                    active_out.close();
+                }
                 active_file_id = file_id;
                 active_file_start_offset = offset;
-                std::string full_path = fileio::NormalizePath(save_dir + "/" + file_meta.relative_path);
-                InitializeHashForResume(active_file_sha, full_path, offset);
-            }
+                active_out_path = fileio::NormalizePath(save_dir + "/" + file_meta.relative_path);
 
-            // Write chunk to file
-            std::string full_path = fileio::NormalizePath(save_dir + "/" + file_meta.relative_path);
-            
-            std::string dir = fileio::GetDirectoryOfPath(full_path);
-            if (!dir.empty()) {
-                fileio::CreateDirectoryRecursive(dir);
-            }
-
-            std::ofstream out(full_path, std::ios::binary | std::ios::in | std::ios::out);
-            if (!out.is_open()) {
-                out.open(full_path, std::ios::binary | std::ios::out);
-                if (out.is_open()) {
-                    out.close();
-                    out.open(full_path, std::ios::binary | std::ios::in | std::ios::out);
+                std::string dir = fileio::GetDirectoryOfPath(active_out_path);
+                if (!dir.empty()) {
+                    fileio::CreateDirectoryRecursive(dir);
                 }
+
+                // Open file once for the entire file's transfer
+                active_out.open(active_out_path, std::ios::binary | std::ios::in | std::ios::out);
+                if (!active_out.is_open()) {
+                    active_out.open(active_out_path, std::ios::binary | std::ios::out);
+                    if (active_out.is_open()) {
+                        active_out.close();
+                        active_out.open(active_out_path, std::ios::binary | std::ios::in | std::ios::out);
+                    }
+                }
+                InitializeHashForResume(active_file_sha, active_out_path, offset);
             }
 
+            // Write chunk using persistent file handle (no open/close per chunk)
             uint8_t status = 0;
-            if (out.is_open()) {
-                out.seekp(offset, std::ios::beg);
-                out.write(reinterpret_cast<const char*>(chunk_data), chunk_size);
-                out.flush();
-                out.close();
+            if (active_out.is_open()) {
+                active_out.seekp(offset, std::ios::beg);
+                active_out.write(reinterpret_cast<const char*>(chunk_data), chunk_size);
                 status = 1;
-                
-                // Update running hash context
-                active_file_sha.Update(chunk_data, chunk_size);
-            }
 
-            // If this is the last chunk, perform final validation!
-            if (status == 1 && (offset + chunk_size >= file_meta.total_size)) {
-                std::string final_hash = active_file_sha.FinalHex();
-                if (final_hash != file_meta.file_hash) {
-                    // Validation failed! Delete file
-                    std::filesystem::remove(full_path);
-                    status = 2; // status 2 means validation failure
+                // Update running hash context (free — data already in memory)
+                active_file_sha.Update(chunk_data, chunk_size);
+
+                // On last chunk: finalize hash and store it.
+                // Do NOT validate yet — wait for FILE_HASH_UPDATE from sender.
+                if (offset + chunk_size >= file_meta.total_size) {
+                    active_file_computed_hash = active_file_sha.FinalHex();
+                    active_out.flush(); // Flush file to disk on completion
                 }
             }
 
-            // Send ACK
+            // Send write-confirm ACK (not validation — that happens on FILE_HASH_UPDATE)
             std::vector<uint8_t> ack_payload(13);
             network::WriteUint32(ack_payload.data(), file_id);
             network::WriteUint64(ack_payload.data() + 4, offset);
             ack_payload[12] = status;
-
             network::SendPacket(s, network::PacketType::CHUNK_ACK, ack_payload);
 
             if (status == 1) {
                 if (!progress_started) {
                     std::cout << "\n──────────────────────────────────────────────────" << std::endl;
                     std::cout << ui::Bold() << "📦 Receiving: " << root_name << " (Press Ctrl+C to abort)\n" << ui::Reset() << std::endl;
-                    progress.Start(total_size, files_count);
+                    progress.Start(total_size, files_count, bytes_received);
                     progress_started = true;
                 }
-
                 bytes_received += chunk_size;
-                if (offset + chunk_size >= file_meta.total_size) {
-                    files_completed++;
-                }
-                progress.Update(bytes_received, files_completed);
-            } else if (status == 2) {
-                // Subtract bytes received for this file attempt to keep progress bar accurate
-                uint64_t bytes_sent_this_attempt = (offset + chunk_size - active_file_start_offset);
-                if (bytes_received >= bytes_sent_this_attempt) {
-                    bytes_received -= bytes_sent_this_attempt;
-                } else {
-                    bytes_received = 0;
-                }
                 progress.Update(bytes_received, files_completed);
             }
         }

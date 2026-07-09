@@ -87,7 +87,10 @@ namespace network {
         FILE_METADATA = 5,
         FILE_CHUNK = 6,
         CHUNK_ACK = 7,
-        SESSION_END = 8
+        SESSION_END = 8,
+        FILE_HASH_UPDATE = 9,  // Sent by sender to update receiver's expected hash after lazy compute
+        PING = 10,             // Adaptive chunk size: RTT measurement request
+        PONG = 11              // Adaptive chunk size: RTT measurement response
     };
 
     const uint8_t MAGIC_BYTES[4] = {'W', 'A', 'R', 'P'};
